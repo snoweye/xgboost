@@ -13,6 +13,7 @@
 #include "../../../src/tree/param.h"
 #include "../../../src/tree/updater_quantile_hist.h"
 #include "../../../src/tree/split_evaluator.h"
+#include "xgboost/data.h"
 
 namespace xgboost {
 namespace tree {
@@ -26,8 +27,9 @@ class QuantileHistMock : public QuantileHistMaker {
     BuilderMock(const TrainParam& param,
                 std::unique_ptr<TreeUpdater> pruner,
                 std::unique_ptr<SplitEvaluator> spliteval,
-                FeatureInteractionConstraintHost int_constraint)
-        : RealImpl(param, std::move(pruner), std::move(spliteval), std::move(int_constraint)) {}
+                FeatureInteractionConstraintHost int_constraint,
+                DMatrix const* fmat)
+        : RealImpl(param, std::move(pruner), std::move(spliteval), std::move(int_constraint), fmat) {}
 
    public:
     void TestInitData(const GHistIndexMatrix& gmat,
@@ -162,7 +164,7 @@ class QuantileHistMock : public QuantileHistMaker {
       }
       // Initialize split evaluator
       std::unique_ptr<SplitEvaluator> evaluator(SplitEvaluator::Create("elastic_net"));
-      evaluator->Init({});
+      evaluator->Init(&param_);
 
       // Now enumerate all feature*threshold combination to get best split
       // To simplify logic, we make some assumptions:
@@ -209,7 +211,8 @@ class QuantileHistMock : public QuantileHistMaker {
       }
 
       /* Now compare against result given by EvaluateSplit() */
-      RealImpl::EvaluateSplit(0, gmat, hist_, *(*dmat), tree);
+      ExpandEntry node(0, tree.GetDepth(0), snode_[0].best.loss_chg, 0);
+      RealImpl::EvaluateSplit({node}, gmat, hist_, *(*dmat), tree);
       ASSERT_EQ(snode_[0].best.SplitIndex(), best_split_feature);
       ASSERT_EQ(snode_[0].best.split_value, gmat.cut.Values()[best_split_threshold]);
 
@@ -235,13 +238,15 @@ class QuantileHistMock : public QuantileHistMaker {
       const std::vector<std::pair<std::string, std::string> >& args) :
       cfg_{args} {
     QuantileHistMaker::Configure(args);
+    spliteval_->Init(&param_);
+    dmat_ = CreateDMatrix(kNRows, kNCols, 0.8, 3);
     builder_.reset(
         new BuilderMock(
             param_,
             std::move(pruner_),
             std::unique_ptr<SplitEvaluator>(spliteval_->GetHostClone()),
-            int_constraint_));
-    dmat_ = CreateDMatrix(kNRows, kNCols, 0.8, 3);
+            int_constraint_,
+            dmat_->get()));
   }
   ~QuantileHistMock() override { delete dmat_; }
 

@@ -15,6 +15,7 @@
 #include "../common/io.h"
 #include "../common/version.h"
 #include "../common/group_data.h"
+#include "../data/adapter.h"
 
 #if DMLC_ENABLE_STD_THREAD
 #include "./sparse_page_source.h"
@@ -33,7 +34,6 @@ namespace xgboost {
 void MetaInfo::Clear() {
   num_row_ = num_col_ = num_nonzero_ = 0;
   labels_.HostVector().clear();
-  root_index_.clear();
   group_ptr_.clear();
   weights_.HostVector().clear();
   base_margin_.HostVector().clear();
@@ -47,7 +47,6 @@ void MetaInfo::SaveBinary(dmlc::Stream *fo) const {
   fo->Write(labels_.HostVector());
   fo->Write(group_ptr_);
   fo->Write(weights_.HostVector());
-  fo->Write(root_index_);
   fo->Write(base_margin_.HostVector());
 }
 
@@ -68,7 +67,6 @@ void MetaInfo::LoadBinary(dmlc::Stream *fi) {
   CHECK(fi->Read(&group_ptr_)) << "MetaInfo: invalid format";
 
   CHECK(fi->Read(&weights_.HostVector())) << "MetaInfo: invalid format";
-  CHECK(fi->Read(&root_index_)) << "MetaInfo: invalid format";
   CHECK(fi->Read(&base_margin_.HostVector())) << "MetaInfo: invalid format";
 }
 
@@ -120,11 +118,7 @@ inline bool MetaTryLoadFloatInfo(const std::string& fname,
   }                                                                     \
 
 void MetaInfo::SetInfo(const char* key, const void* dptr, DataType dtype, size_t num) {
-  if (!std::strcmp(key, "root_index")) {
-    root_index_.resize(num);
-    DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
-                       std::copy(cast_dptr, cast_dptr + num, root_index_.begin()));
-  } else if (!std::strcmp(key, "label")) {
+  if (!std::strcmp(key, "label")) {
     auto& labels = labels_.HostVector();
     labels.resize(num);
     DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
@@ -207,6 +201,7 @@ DMatrix* DMatrix::Load(const std::string& uri,
     LOG(CONSOLE) << "Load part of data " << partid
                  << " of " << npart << " parts";
   }
+
   // legacy handling of binary data loading
   if (file_format == "auto" && npart == 1) {
     int magic;
@@ -214,13 +209,13 @@ DMatrix* DMatrix::Load(const std::string& uri,
     if (fi != nullptr) {
       common::PeekableInStream is(fi.get());
       if (is.PeekRead(&magic, sizeof(magic)) == sizeof(magic) &&
-          magic == data::SimpleCSRSource::kMagic) {
+        magic == data::SimpleCSRSource::kMagic) {
         std::unique_ptr<data::SimpleCSRSource> source(new data::SimpleCSRSource());
         source->LoadBinary(&is);
         DMatrix* dmat = DMatrix::Create(std::move(source), cache_file);
         if (!silent) {
           LOG(CONSOLE) << dmat->Info().num_row_ << 'x' << dmat->Info().num_col_ << " matrix with "
-                       << dmat->Info().num_nonzero_ << " entries loaded from " << uri;
+            << dmat->Info().num_nonzero_ << " entries loaded from " << uri;
         }
         return dmat;
       }
@@ -229,10 +224,12 @@ DMatrix* DMatrix::Load(const std::string& uri,
 
   std::unique_ptr<dmlc::Parser<uint32_t> > parser(
       dmlc::Parser<uint32_t>::Create(fname.c_str(), partid, npart, file_format.c_str()));
+  data::FileAdapter adapter(parser.get());
   DMatrix* dmat {nullptr};
 
   try {
-    dmat = DMatrix::Create(parser.get(), cache_file, page_size);
+    dmat = DMatrix::Create(&adapter, std::numeric_limits<float>::quiet_NaN(), 1,
+                           cache_file, page_size);
   } catch (dmlc::Error& e) {
     std::vector<std::string> splited = common::Split(fname, '#');
     std::vector<std::string> args = common::Split(splited.front(), '?');
@@ -287,27 +284,6 @@ DMatrix* DMatrix::Load(const std::string& uri,
   return dmat;
 }
 
-DMatrix* DMatrix::Create(dmlc::Parser<uint32_t>* parser,
-                         const std::string& cache_prefix,
-                         const size_t page_size) {
-  if (cache_prefix.length() == 0) {
-    std::unique_ptr<data::SimpleCSRSource> source(new data::SimpleCSRSource());
-    source->CopyFrom(parser);
-    return DMatrix::Create(std::move(source), cache_prefix);
-  } else {
-#if DMLC_ENABLE_STD_THREAD
-    if (!data::SparsePageSource<SparsePage>::CacheExist(cache_prefix, ".row.page")) {
-      data::SparsePageSource<SparsePage>::CreateRowPage(parser, cache_prefix, page_size);
-    }
-    std::unique_ptr<data::SparsePageSource<SparsePage>> source(
-        new data::SparsePageSource<SparsePage>(cache_prefix, ".row.page"));
-    return DMatrix::Create(std::move(source), cache_prefix);
-#else
-    LOG(FATAL) << "External memory is not enabled in mingw";
-    return nullptr;
-#endif  // DMLC_ENABLE_STD_THREAD
-  }
-}
 
 void DMatrix::SaveToLocalFile(const std::string& fname) {
   data::SimpleCSRSource source;
@@ -319,32 +295,8 @@ void DMatrix::SaveToLocalFile(const std::string& fname) {
 DMatrix* DMatrix::Create(std::unique_ptr<DataSource<SparsePage>>&& source,
                          const std::string& cache_prefix) {
   if (cache_prefix.length() == 0) {
-    // FIXME(trivialfis): Currently distcol is broken so we here check for number of rows.
-    // If we bring back column split this check will break.
-    bool is_distributed { rabit::IsDistributed() };
-    if (is_distributed) {
-      auto world_size = rabit::GetWorldSize();
-      auto rank = rabit::GetRank();
-      std::vector<uint64_t> ncols(world_size, 0);
-      ncols[rank] = source->info.num_col_;
-      rabit::Allreduce<rabit::op::Sum>(ncols.data(), ncols.size());
-      auto max_cols = std::max_element(ncols.cbegin(), ncols.cend());
-      auto max_ind = std::distance(ncols.cbegin(), max_cols);
-      // FIXME(trivialfis): This is a hack, we should store a reference to global shape if possible.
-      if (source->info.num_col_ == 0 && source->info.num_row_ == 0) {
-        LOG(WARNING) << "DMatrix at rank: " << rank << " worker is empty.";
-        source->info.num_col_ = *max_cols;
-      }
-
-      // validate the number of columns across all workers.
-      for (size_t i = 0; i < ncols.size(); ++i) {
-        auto v = ncols[i];
-        CHECK(v == 0 || v == *max_cols)
-            << "DMatrix at rank: " << i << " worker "
-            << "has different number of columns than rank: " << max_ind << " worker. "
-            << "(" << v << " vs. " << *max_cols << ")";
-      }
-    }
+    // Data split mode is fixed to be row right now.
+    rabit::Allreduce<rabit::op::Max>(&source->info.num_col_, 1);
     return new data::SimpleDMatrix(std::move(source));
   } else {
 #if DMLC_ENABLE_STD_THREAD
@@ -355,9 +307,43 @@ DMatrix* DMatrix::Create(std::unique_ptr<DataSource<SparsePage>>&& source,
 #endif  // DMLC_ENABLE_STD_THREAD
   }
 }
-}  // namespace xgboost
 
-namespace xgboost {
+template <typename AdapterT>
+DMatrix* DMatrix::Create(AdapterT* adapter, float missing, int nthread,
+                         const std::string& cache_prefix,  size_t page_size ) {
+  if (cache_prefix.length() == 0) {
+    // Data split mode is fixed to be row right now.
+    return new data::SimpleDMatrix(adapter, missing, nthread);
+  } else {
+#if DMLC_ENABLE_STD_THREAD
+    return new data::SparsePageDMatrix(adapter, missing, nthread, cache_prefix,
+                                       page_size);
+#else
+    LOG(FATAL) << "External memory is not enabled in mingw";
+    return nullptr;
+#endif  // DMLC_ENABLE_STD_THREAD
+  }
+}
+
+template DMatrix* DMatrix::Create<data::DenseAdapter>(
+    data::DenseAdapter* adapter, float missing, int nthread,
+    const std::string& cache_prefix, size_t page_size);
+template DMatrix* DMatrix::Create<data::CSRAdapter>(
+    data::CSRAdapter* adapter, float missing, int nthread,
+    const std::string& cache_prefix, size_t page_size);
+template DMatrix* DMatrix::Create<data::CSCAdapter>(
+    data::CSCAdapter* adapter, float missing, int nthread,
+    const std::string& cache_prefix, size_t page_size);
+template DMatrix* DMatrix::Create<data::DataTableAdapter>(
+    data::DataTableAdapter* adapter, float missing, int nthread,
+    const std::string& cache_prefix, size_t page_size);
+template DMatrix* DMatrix::Create<data::FileAdapter>(
+    data::FileAdapter* adapter, float missing, int nthread,
+    const std::string& cache_prefix, size_t page_size);
+template DMatrix* DMatrix::Create<data::DMatrixSliceAdapter>(
+    data::DMatrixSliceAdapter* adapter, float missing, int nthread,
+    const std::string& cache_prefix, size_t page_size);
+
 SparsePage SparsePage::GetTranspose(int num_columns) const {
   SparsePage transpose;
   common::ParallelGroupBuilder<Entry, bst_row_t> builder(&transpose.offset.HostVector(),
@@ -404,21 +390,72 @@ void SparsePage::Push(const SparsePage &batch) {
   }
 }
 
-void SparsePage::Push(const dmlc::RowBlock<uint32_t>& batch) {
-  auto& data_vec = data.HostVector();
+template <typename AdapterBatchT>
+uint64_t SparsePage::Push(const AdapterBatchT& batch, float missing, int nthread) {
+  // Set number of threads but keep old value so we can reset it after
+  const int nthreadmax = omp_get_max_threads();
+  if (nthread <= 0) nthread = nthreadmax;
+  int nthread_original = omp_get_max_threads();
+  omp_set_num_threads(nthread);
   auto& offset_vec = offset.HostVector();
-  data_vec.reserve(data.Size() + batch.offset[batch.size] - batch.offset[0]);
-  offset_vec.reserve(offset.Size() + batch.size);
-  CHECK(batch.index != nullptr);
-  for (size_t i = 0; i < batch.size; ++i) {
-    offset_vec.push_back(offset_vec.back() + batch.offset[i + 1] - batch.offset[i]);
+  auto& data_vec = data.HostVector();
+  size_t builder_base_row_offset = this->Size();
+  common::ParallelGroupBuilder<
+      Entry, std::remove_reference<decltype(offset_vec)>::type::value_type>
+      builder(&offset_vec, &data_vec, builder_base_row_offset);
+  // Estimate expected number of rows by using last element in batch
+  // This is not required to be exact but prevents unnecessary resizing
+  size_t expected_rows = 0;
+  if (batch.Size() > 0) {
+    auto last_line = batch.GetLine(batch.Size() - 1);
+    if (last_line.Size() > 0) {
+      expected_rows =
+          last_line.GetElement(last_line.Size() - 1).row_idx - base_rowid;
+    }
   }
-  for (size_t i = batch.offset[0]; i < batch.offset[batch.size]; ++i) {
-    uint32_t index = batch.index[i];
-    bst_float fvalue = batch.value == nullptr ? 1.0f : batch.value[i];
-    data_vec.emplace_back(index, fvalue);
+  builder.InitBudget(expected_rows, nthread);
+  uint64_t max_columns = 0;
+
+  // First-pass over the batch counting valid elements
+  size_t num_lines = batch.Size();
+#pragma omp parallel for schedule(static)
+  for (omp_ulong i = 0; i < static_cast<omp_ulong>(num_lines);
+       ++i) {  // NOLINT(*)
+    int tid = omp_get_thread_num();
+    auto line = batch.GetLine(i);
+    for (auto j = 0ull; j < line.Size(); j++) {
+      auto element = line.GetElement(j);
+      max_columns =
+          std::max(max_columns, static_cast<uint64_t>(element.column_idx + 1));
+      if (!common::CheckNAN(element.value) && element.value != missing) {
+        size_t key = element.row_idx -
+                     base_rowid;  // Adapter row index is absolute, here we want
+                                  // it relative to current page
+        CHECK_GE(key,  builder_base_row_offset);
+        builder.AddBudget(element.row_idx - base_rowid, tid);
+      }
+    }
   }
-  CHECK_EQ(offset_vec.back(), data.Size());
+  builder.InitStorage();
+
+  // Second pass over batch, placing elements in correct position
+#pragma omp parallel for schedule(static)
+  for (omp_ulong i = 0; i < static_cast<omp_ulong>(num_lines);
+       ++i) {  // NOLINT(*)
+    int tid = omp_get_thread_num();
+    auto line = batch.GetLine(i);
+    for (auto j = 0ull; j < line.Size(); j++) {
+      auto element = line.GetElement(j);
+      if (!common::CheckNAN(element.value) && element.value != missing) {
+        size_t key = element.row_idx -
+                     base_rowid;  // Adapter row index is absolute, here we want
+                                  // it relative to current page
+        builder.Push(key, Entry(element.column_idx, element.value), tid);
+      }
+    }
+  }
+  omp_set_num_threads(nthread_original);
+  return max_columns;
 }
 
 void SparsePage::PushCSC(const SparsePage &batch) {

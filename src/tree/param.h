@@ -1,5 +1,5 @@
 /*!
- * Copyright 2014 by Contributors
+ * Copyright 2014-2019 by Contributors
  * \file param.h
  * \brief training parameters, statistics used to support tree construction.
  * \author Tianqi Chen
@@ -56,23 +56,17 @@ struct TrainParam : public XGBoostParameter<TrainParam> {
   float colsample_bylevel;
   // whether to subsample columns during tree construction
   float colsample_bytree;
-  // speed optimization for dense column
-  float opt_dense_col;
   // accuracy of sketch
   float sketch_eps;
   // accuracy of sketch
   float sketch_ratio;
-  // option for parallelization
-  int parallel_option;
   // option to open cacheline optimization
   bool cache_opt;
   // whether refresh updater needs to update the leaf values
   bool refresh_leaf;
 
-  // FIXME(trivialfis): Following constraints are used by gpu
-  // algorithm, duplicated with those defined split evaluator due to
-  // their different code paths.
   std::vector<int> monotone_constraints;
+  // Stored as a JSON string.
   std::string interaction_constraints;
 
   // the criteria to use for ranking splits
@@ -162,10 +156,6 @@ struct TrainParam : public XGBoostParameter<TrainParam> {
         .set_range(0.0f, 1.0f)
         .set_default(1.0f)
         .describe("Subsample ratio of columns, resample on each tree construction.");
-    DMLC_DECLARE_FIELD(opt_dense_col)
-        .set_range(0.0f, 1.0f)
-        .set_default(1.0f)
-        .describe("EXP Param: speed optimization for dense column.");
     DMLC_DECLARE_FIELD(sketch_eps)
         .set_range(0.0f, 1.0f)
         .set_default(0.03f)
@@ -174,9 +164,6 @@ struct TrainParam : public XGBoostParameter<TrainParam> {
         .set_lower_bound(0.0f)
         .set_default(2.0f)
         .describe("EXP Param: Sketch accuracy related parameter of approximate algorithm.");
-    DMLC_DECLARE_FIELD(parallel_option)
-        .set_default(0)
-        .describe("Different types of parallelization algorithm.");
     DMLC_DECLARE_FIELD(cache_opt)
         .set_default(true)
         .describe("EXP Param: Cache aware optimization.");
@@ -220,16 +207,7 @@ struct TrainParam : public XGBoostParameter<TrainParam> {
     DMLC_DECLARE_ALIAS(min_split_loss, gamma);
     DMLC_DECLARE_ALIAS(learning_rate, eta);
   }
-  /*! \brief whether need forward small to big search: default right */
-  inline bool NeedForwardSearch(float col_density, bool indicator) const {
-    return this->default_direction == 2 ||
-           (default_direction == 0 && (col_density < opt_dense_col) &&
-            !indicator);
-  }
-  /*! \brief whether need backward big to small search: default left */
-  inline bool NeedBackwardSearch(float col_density, bool indicator) const {
-    return this->default_direction != 2;
-  }
+
   /*! \brief given the loss change, whether we need to invoke pruning */
   inline bool NeedPrune(double loss_chg, int depth) const {
     return loss_chg < this->min_split_loss;
@@ -495,63 +473,7 @@ inline std::ostream &operator<<(std::ostream &os, const std::vector<int> &t) {
   return os;
 }
 
-inline std::istream &operator>>(std::istream &is, std::vector<int> &t) {
-  // get (
-  while (true) {
-    char ch = is.peek();
-    if (isdigit(ch)) {
-      int idx;
-      if (is >> idx) {
-        t.assign(&idx, &idx + 1);
-      }
-      return is;
-    }
-    is.get();
-    if (ch == '(') {
-      break;
-    }
-    if (!isspace(ch)) {
-      is.setstate(std::ios::failbit);
-      return is;
-    }
-  }
-  int idx;
-  std::vector<int> tmp;
-  while (is >> idx) {
-    tmp.push_back(idx);
-    char ch;
-    do {
-      ch = is.get();
-    } while (isspace(ch));
-    if (ch == 'L') {
-      ch = is.get();
-    }
-    if (ch == ',') {
-      while (true) {
-        ch = is.peek();
-        if (isspace(ch)) {
-          is.get();
-          continue;
-        }
-        if (ch == ')') {
-          is.get();
-          break;
-        }
-        break;
-      }
-      if (ch == ')') {
-        break;
-      }
-    } else if (ch == ')') {
-      break;
-    } else {
-      is.setstate(std::ios::failbit);
-      return is;
-    }
-  }
-  t.assign(tmp.begin(), tmp.end());
-  return is;
-}
+std::istream &operator>>(std::istream &is, std::vector<int> &t);
 }  // namespace std
 
 #endif  // XGBOOST_TREE_PARAM_H_

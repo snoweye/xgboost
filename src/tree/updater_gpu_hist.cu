@@ -18,6 +18,7 @@
 #include "xgboost/host_device_vector.h"
 #include "xgboost/parameter.h"
 #include "xgboost/span.h"
+#include "xgboost/json.h"
 
 #include "../common/common.h"
 #include "../common/compressed_iterator.h"
@@ -1026,9 +1027,6 @@ class GPUHistMakerSpecialised {
     param_.UpdateAllowUnknown(args);
     generic_param_ = generic_param;
     hist_maker_param_.UpdateAllowUnknown(args);
-    device_ = generic_param_->gpu_id;
-    CHECK_GE(device_, 0) << "Must have at least one device";
-
     dh::CheckComputeCapability();
 
     monitor_.Init("updater_gpu_hist");
@@ -1041,6 +1039,7 @@ class GPUHistMakerSpecialised {
   void Update(HostDeviceVector<GradientPair>* gpair, DMatrix* dmat,
               const std::vector<RegTree*>& trees) {
     monitor_.StartCuda("Update");
+
     // rescale learning rate according to size of trees
     float lr = param_.learning_rate;
     param_.learning_rate = lr / trees.size();
@@ -1064,6 +1063,8 @@ class GPUHistMakerSpecialised {
   }
 
   void InitDataOnce(DMatrix* dmat) {
+    device_ = generic_param_->gpu_id;
+    CHECK_GE(device_, 0) << "Must have at least one device";
     info_ = &dmat->Info();
     reducer_.Init({device_});
 
@@ -1110,12 +1111,12 @@ class GPUHistMakerSpecialised {
     common::MemoryBufferStream fs(&s_model);
     int rank = rabit::GetRank();
     if (rank == 0) {
-      local_tree->SaveModel(&fs);
+      local_tree->Save(&fs);
     }
     fs.Seek(0);
     rabit::Broadcast(&s_model, 0);
     RegTree reference_tree {};  // rank 0 tree
-    reference_tree.LoadModel(&fs);
+    reference_tree.Load(&fs);
     CHECK(*local_tree == reference_tree);
   }
 
@@ -1129,8 +1130,7 @@ class GPUHistMakerSpecialised {
     maker->UpdateTree(gpair, p_fmat, p_tree, &reducer_);
   }
 
-  bool UpdatePredictionCache(
-      const DMatrix* data, HostDeviceVector<bst_float>* p_out_preds) {
+  bool UpdatePredictionCache(const DMatrix* data, HostDeviceVector<bst_float>* p_out_preds) {
     if (maker == nullptr || p_last_fmat_ == nullptr || p_last_fmat_ != data) {
       return false;
     }
@@ -1141,8 +1141,8 @@ class GPUHistMakerSpecialised {
     return true;
   }
 
-  TrainParam param_;           // NOLINT
-  MetaInfo* info_{};             // NOLINT
+  TrainParam param_;   // NOLINT
+  MetaInfo* info_{};   // NOLINT
 
   std::unique_ptr<GPUHistMakerDevice<GradientSumT>> maker;  // NOLINT
 
@@ -1163,15 +1163,46 @@ class GPUHistMakerSpecialised {
 class GPUHistMaker : public TreeUpdater {
  public:
   void Configure(const Args& args) override {
+    // Used in test to count how many configurations are performed
+    LOG(DEBUG) << "[GPU Hist]: Configure";
     hist_maker_param_.UpdateAllowUnknown(args);
-    float_maker_.reset();
-    double_maker_.reset();
+    // The passed in args can be empty, if we simply purge the old maker without
+    // preserving parameters then we can't do Update on it.
+    TrainParam param;
+    if (float_maker_) {
+      param = float_maker_->param_;
+    } else if (double_maker_) {
+      param = double_maker_->param_;
+    }
     if (hist_maker_param_.single_precision_histogram) {
       float_maker_.reset(new GPUHistMakerSpecialised<GradientPair>());
+      float_maker_->param_ = param;
       float_maker_->Configure(args, tparam_);
     } else {
       double_maker_.reset(new GPUHistMakerSpecialised<GradientPairPrecise>());
+      double_maker_->param_ = param;
       double_maker_->Configure(args, tparam_);
+    }
+  }
+
+  void LoadConfig(Json const& in) override {
+    auto const& config = get<Object const>(in);
+    fromJson(config.at("gpu_hist_train_param"), &this->hist_maker_param_);
+    if (hist_maker_param_.single_precision_histogram) {
+      float_maker_.reset(new GPUHistMakerSpecialised<GradientPair>());
+      fromJson(config.at("train_param"), &float_maker_->param_);
+    } else {
+      double_maker_.reset(new GPUHistMakerSpecialised<GradientPairPrecise>());
+      fromJson(config.at("train_param"), &double_maker_->param_);
+    }
+  }
+  void SaveConfig(Json* p_out) const override {
+    auto& out = *p_out;
+    out["gpu_hist_train_param"] = toJson(hist_maker_param_);
+    if (hist_maker_param_.single_precision_histogram) {
+      out["train_param"] = toJson(float_maker_->param_);
+    } else {
+      out["train_param"] = toJson(double_maker_->param_);
     }
   }
 
