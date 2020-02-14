@@ -1,3 +1,6 @@
+/*!
+ * Copyright 2019-2020 XGBoost contributors
+ */
 #include <gtest/gtest.h>
 #include <dmlc/filesystem.h>
 #include <xgboost/generic_parameters.h>
@@ -62,7 +65,7 @@ TEST(GBTree, ChoosePredictor) {
   auto learner = std::unique_ptr<Learner>(Learner::Create({p_dmat}));
   learner->SetParams(Args{{"tree_method", "gpu_hist"}, {"gpu_id", "0"}});
   for (size_t i = 0; i < 4; ++i) {
-    learner->UpdateOneIter(i, p_dmat.get());
+    learner->UpdateOneIter(i, p_dmat);
   }
   ASSERT_TRUE(data.HostCanWrite());
   dmlc::TemporaryDirectory tempdir;
@@ -81,7 +84,7 @@ TEST(GBTree, ChoosePredictor) {
   }
   learner->SetParams(Args{{"tree_method", "gpu_hist"}, {"gpu_id", "0"}});
   for (size_t i = 0; i < 4; ++i) {
-    learner->UpdateOneIter(i, p_dmat.get());
+    learner->UpdateOneIter(i, p_dmat);
   }
   ASSERT_TRUE(data.HostCanWrite());
 
@@ -94,7 +97,7 @@ TEST(GBTree, ChoosePredictor) {
   learner = std::unique_ptr<Learner>(Learner::Create({p_dmat}));
   learner->SetParams(Args{{"tree_method", "gpu_hist"}, {"gpu_id", "0"}});
   for (size_t i = 0; i < 4; ++i) {
-    learner->UpdateOneIter(i, p_dmat.get());
+    learner->UpdateOneIter(i, p_dmat);
   }
   // data is not pulled back into host
   ASSERT_FALSE(data.HostCanWrite());
@@ -103,8 +106,8 @@ TEST(GBTree, ChoosePredictor) {
 }
 #endif  // XGBOOST_USE_CUDA
 
-// Some other parts of test are in `Tree.Json_IO'.
-TEST(GBTree, Json_IO) {
+// Some other parts of test are in `Tree.JsonIO'.
+TEST(GBTree, JsonIO) {
   size_t constexpr kRows = 16, kCols = 16;
 
   LearnerModelParam mparam;
@@ -143,7 +146,7 @@ TEST(GBTree, Json_IO) {
   ASSERT_EQ(get<String>(j_train_param["num_parallel_tree"]), "1");
 }
 
-TEST(Dart, Json_IO) {
+TEST(Dart, JsonIO) {
   size_t constexpr kRows = 16, kCols = 16;
 
   LearnerModelParam mparam;
@@ -196,13 +199,13 @@ TEST(Dart, Prediction) {
   learner->Configure();
 
   for (size_t i = 0; i < 16; ++i) {
-    learner->UpdateOneIter(i, p_mat.get());
+    learner->UpdateOneIter(i, p_mat);
   }
 
   HostDeviceVector<float> predts_training;
-  learner->Predict(p_mat.get(), false, &predts_training, 0, true);
+  learner->Predict(p_mat, false, &predts_training, 0, true);
   HostDeviceVector<float> predts_inference;
-  learner->Predict(p_mat.get(), false, &predts_inference, 0, false);
+  learner->Predict(p_mat, false, &predts_inference, 0, false);
 
   auto& h_predts_training = predts_training.ConstHostVector();
   auto& h_predts_inference = predts_inference.ConstHostVector();

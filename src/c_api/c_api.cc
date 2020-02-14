@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2019 by Contributors
+// Copyright (c) 2014-2020 by Contributors
 #include <dmlc/thread_local.h>
 #include <rabit/rabit.h>
 #include <rabit/c_api.h>
@@ -206,12 +206,24 @@ int XGDMatrixCreateFromDataIter(
 }
 
 #ifndef XGBOOST_USE_CUDA
-XGB_DLL int XGDMatrixCreateFromArrayInterfaces(
-  char const* c_json_strs, bst_int has_missing, bst_float missing, DMatrixHandle* out) {
+XGB_DLL int XGDMatrixCreateFromArrayInterfaceColumns(char const* c_json_strs,
+                                                     bst_float missing,
+                                                     int nthread,
+                                                     DMatrixHandle* out) {
   API_BEGIN();
   LOG(FATAL) << "Xgboost not compiled with cuda";
   API_END();
 }
+
+XGB_DLL int XGDMatrixCreateFromArrayInterface(char const* c_json_strs,
+                                                     bst_float missing,
+                                                     int nthread,
+                                                     DMatrixHandle* out) {
+  API_BEGIN();
+  LOG(FATAL) << "Xgboost not compiled with cuda";
+  API_END();
+}
+
 #endif
 
 XGB_DLL int XGDMatrixCreateFromCSREx(const size_t* indptr,
@@ -245,7 +257,7 @@ XGB_DLL int XGDMatrixCreateFromMat(const bst_float* data,
                                    xgboost::bst_ulong ncol, bst_float missing,
                                    DMatrixHandle* out) {
   API_BEGIN();
-  data::DenseAdapter adapter(data, nrow, nrow * ncol, ncol);
+  data::DenseAdapter adapter(data, nrow, ncol);
   *out = new std::shared_ptr<DMatrix>(DMatrix::Create(&adapter, missing, 1));
   API_END();
 }
@@ -256,7 +268,7 @@ XGB_DLL int XGDMatrixCreateFromMat_omp(const bst_float* data,  // NOLINT
                                        bst_float missing, DMatrixHandle* out,
                                        int nthread) {
   API_BEGIN();
-  data::DenseAdapter adapter(data, nrow, nrow * ncol, ncol);
+  data::DenseAdapter adapter(data, nrow, ncol);
   *out = new std::shared_ptr<DMatrix>(DMatrix::Create(&adapter, missing, nthread));
   API_END();
 }
@@ -299,7 +311,7 @@ XGB_DLL int XGDMatrixSliceDMatrixEx(DMatrixHandle handle,
   DMatrix* dmat = static_cast<std::shared_ptr<DMatrix>*>(handle)->get();
   CHECK(dynamic_cast<data::SimpleDMatrix*>(dmat))
       << "Slice only supported for SimpleDMatrix currently.";
-  data::DMatrixSliceAdapter adapter(dmat, {idxset, len});
+  data::DMatrixSliceAdapter adapter(dmat, {idxset, static_cast<size_t>(len)});
   *out = new std::shared_ptr<DMatrix>(
       DMatrix::Create(&adapter, std::numeric_limits<float>::quiet_NaN(), 1));
   API_END();
@@ -328,7 +340,7 @@ XGB_DLL int XGDMatrixSetFloatInfo(DMatrixHandle handle,
   API_BEGIN();
   CHECK_HANDLE();
   static_cast<std::shared_ptr<DMatrix>*>(handle)
-      ->get()->Info().SetInfo(field, info, kFloat32, len);
+      ->get()->Info().SetInfo(field, info, xgboost::DataType::kFloat32, len);
   API_END();
 }
 
@@ -349,7 +361,7 @@ XGB_DLL int XGDMatrixSetUIntInfo(DMatrixHandle handle,
   API_BEGIN();
   CHECK_HANDLE();
   static_cast<std::shared_ptr<DMatrix>*>(handle)
-      ->get()->Info().SetInfo(field, info, kUInt32, len);
+      ->get()->Info().SetInfo(field, info, xgboost::DataType::kUInt32, len);
   API_END();
 }
 
@@ -360,7 +372,7 @@ XGB_DLL int XGDMatrixSetGroup(DMatrixHandle handle,
   CHECK_HANDLE();
   LOG(WARNING) << "XGDMatrixSetGroup is deprecated, use `XGDMatrixSetUIntInfo` instead.";
   static_cast<std::shared_ptr<DMatrix>*>(handle)
-      ->get()->Info().SetInfo("group", group, kUInt32, len);
+      ->get()->Info().SetInfo("group", group, xgboost::DataType::kUInt32, len);
   API_END();
 }
 
@@ -486,7 +498,7 @@ XGB_DLL int XGBoosterUpdateOneIter(BoosterHandle handle,
   auto *dtr =
       static_cast<std::shared_ptr<DMatrix>*>(dtrain);
 
-  bst->UpdateOneIter(iter, dtr->get());
+  bst->UpdateOneIter(iter, *dtr);
   API_END();
 }
 
@@ -507,7 +519,7 @@ XGB_DLL int XGBoosterBoostOneIter(BoosterHandle handle,
     tmp_gpair_h[i] = GradientPair(grad[i], hess[i]);
   }
 
-  bst->BoostOneIter(0, dtr->get(), &tmp_gpair);
+  bst->BoostOneIter(0, *dtr, &tmp_gpair);
   API_END();
 }
 
@@ -521,11 +533,11 @@ XGB_DLL int XGBoosterEvalOneIter(BoosterHandle handle,
   API_BEGIN();
   CHECK_HANDLE();
   auto* bst = static_cast<Learner*>(handle);
-  std::vector<DMatrix*> data_sets;
+  std::vector<std::shared_ptr<DMatrix>> data_sets;
   std::vector<std::string> data_names;
 
   for (xgboost::bst_ulong i = 0; i < len; ++i) {
-    data_sets.push_back(static_cast<std::shared_ptr<DMatrix>*>(dmats[i])->get());
+    data_sets.push_back(*static_cast<std::shared_ptr<DMatrix>*>(dmats[i]));
     data_names.emplace_back(evnames[i]);
   }
 
@@ -548,7 +560,7 @@ XGB_DLL int XGBoosterPredict(BoosterHandle handle,
   auto *bst = static_cast<Learner*>(handle);
   HostDeviceVector<bst_float> tmp_preds;
   bst->Predict(
-      static_cast<std::shared_ptr<DMatrix>*>(dmat)->get(),
+      *static_cast<std::shared_ptr<DMatrix>*>(dmat),
       (option_mask & 1) != 0,
       &tmp_preds, ntree_limit,
       static_cast<bool>(training),

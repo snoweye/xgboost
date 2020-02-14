@@ -4,6 +4,18 @@ make -f dmlc-core/scripts/packages.mk lz4
 
 source $HOME/miniconda/bin/activate
 
+if [ ${TASK} == "python_sdist_test" ]; then
+    set -e
+
+    conda activate python3
+    python --version
+    conda install numpy scipy
+
+    make pippack
+    python -m pip install xgboost-*.tar.gz -v --user
+    python -c 'import xgboost' || exit -1
+fi
+
 if [ ${TASK} == "python_test" ]; then
     set -e
     # Build/test
@@ -16,10 +28,9 @@ if [ ${TASK} == "python_test" ]; then
     echo "-------------------------------"
     conda activate python3
     python --version
-    conda install numpy scipy pandas matplotlib scikit-learn
+    conda install numpy scipy pandas matplotlib scikit-learn dask
 
     python -m pip install graphviz pytest pytest-cov codecov
-    python -m pip install dask distributed dask[dataframe]
     python -m pip install datatable
     python -m pytest -v --fulltrace -s tests/python --cov=python-package/xgboost || exit -1
     codecov

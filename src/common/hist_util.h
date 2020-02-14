@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <memory>
 #include <utility>
+#include <map>
 
 #include "row_set.h"
+#include "threading_utils.h"
 #include "../tree/param.h"
 #include "./quantile.h"
 #include "./timer.h"
@@ -31,14 +33,17 @@ namespace common {
 template<typename T>
 struct SimpleArray {
   ~SimpleArray() {
-    free(ptr_);
+    std::free(ptr_);
     ptr_ = nullptr;
   }
 
   void resize(size_t n) {
-    T* ptr = static_cast<T*>(malloc(n*sizeof(T)));
-    memcpy(ptr, ptr_, n_ * sizeof(T));
-    free(ptr_);
+    T* ptr = static_cast<T*>(std::malloc(n * sizeof(T)));
+    CHECK(ptr) << "Failed to allocate memory";
+    if (ptr_) {
+      std::memcpy(ptr, ptr_, n_ * sizeof(T));
+      std::free(ptr_);
+    }
     ptr_ = ptr;
     n_ = n;
   }
@@ -96,6 +101,7 @@ struct SimpleArray {
 using GHistIndexRow = Span<uint32_t const>;
 
 // A CSC matrix representing histogram cuts, used in CPU quantile hist.
+// The cut values represent upper bounds of bins containing approximately equal numbers of elements
 class HistogramCuts {
   // Using friends to avoid creating a virtual class, since HistogramCuts is used as value
   // object in many places.
@@ -142,7 +148,9 @@ class HistogramCuts {
 
   size_t TotalBins() const { return cut_ptrs_.back(); }
 
-  BinIdx SearchBin(float value, uint32_t column_id) {
+  // Return the index of a cut point that is strictly greater than the input
+  // value, or the last available index if none exists
+  BinIdx SearchBin(float value, uint32_t column_id) const {
     auto beg = cut_ptrs_.at(column_id);
     auto end = cut_ptrs_.at(column_id + 1);
     auto it = std::upper_bound(cut_values_.cbegin() + beg, cut_values_.cbegin() + end, value);
@@ -166,7 +174,7 @@ class HistogramCuts {
  */
 class CutsBuilder {
  public:
-  using WXQSketch = common::WXQuantileSketch<bst_float, bst_float>;
+  using WQSketch = common::WQuantileSketch<bst_float, bst_float>;
 
  protected:
   HistogramCuts* p_cuts_;
@@ -190,21 +198,12 @@ class CutsBuilder {
     return group_ind;
   }
 
-  void AddCutPoint(WXQSketch::SummaryContainer const& summary) {
-    if (summary.size > 1 && summary.size <= 16) {
-      /* specialized code categorial / ordinal data -- use midpoints */
-      for (size_t i = 1; i < summary.size; ++i) {
-        bst_float cpt = (summary.data[i].value + summary.data[i - 1].value) / 2.0f;
-        if (i == 1 || cpt > p_cuts_->cut_values_.back()) {
-          p_cuts_->cut_values_.push_back(cpt);
-        }
-      }
-    } else {
-      for (size_t i = 2; i < summary.size; ++i) {
-        bst_float cpt = summary.data[i - 1].value;
-        if (i == 2 || cpt > p_cuts_->cut_values_.back()) {
-          p_cuts_->cut_values_.push_back(cpt);
-        }
+  void AddCutPoint(WQSketch::SummaryContainer const& summary, int max_bin) {
+    int required_cuts = std::min(static_cast<int>(summary.size), max_bin);
+    for (size_t i = 1; i < required_cuts; ++i) {
+      bst_float cpt = summary.data[i].value;
+      if (i == 1 || cpt > p_cuts_->cut_values_.back()) {
+        p_cuts_->cut_values_.push_back(cpt);
       }
     }
   }
@@ -245,13 +244,13 @@ class DenseCuts  : public CutsBuilder {
       CutsBuilder(container) {
     monitor_.Init(__FUNCTION__);
   }
-  void Init(std::vector<WXQSketch>* sketchs, uint32_t max_num_bins);
+  void Init(std::vector<WQSketch>* sketchs, uint32_t max_num_bins);
   void Build(DMatrix* p_fmat, uint32_t max_num_bins) override;
 };
 
 // FIXME(trivialfis): Merge this into generic cut builder.
 /*! \brief Builds the cut matrix on the GPU.
- *  
+ *
  *  \return The row stride across the entire dataset.
  */
 size_t DeviceSketch(int device,
@@ -340,12 +339,33 @@ class GHistIndexBlockMatrix {
 };
 
 /*!
- * \brief histogram of graident statistics for a single node.
- *  Consists of multiple GradStats, each entry showing total graident statistics
+ * \brief histogram of gradient statistics for a single node.
+ *  Consists of multiple GradStats, each entry showing total gradient statistics
  *     for that particular bin
  *  Uses global bin id so as to represent all features simultaneously
  */
 using GHistRow = Span<tree::GradStats>;
+
+/*!
+ * \brief fill a histogram by zeros
+ */
+void InitilizeHistByZeroes(GHistRow hist, size_t begin, size_t end);
+
+/*!
+ * \brief Increment hist as dst += add in range [begin, end)
+ */
+void IncrementHist(GHistRow dst, const GHistRow add, size_t begin, size_t end);
+
+/*!
+ * \brief Copy hist from src to dst in range [begin, end)
+ */
+void CopyHist(GHistRow dst, const GHistRow src, size_t begin, size_t end);
+
+/*!
+ * \brief Compute Subtraction: dst = src1 - src2 in range [begin, end)
+ */
+void SubtractionHist(GHistRow dst, const GHistRow src1, const GHistRow src2,
+                     size_t begin, size_t end);
 
 /*!
  * \brief histogram of gradient statistics for multiple nodes
@@ -369,9 +389,13 @@ class HistCollection {
 
   // initialize histogram collection
   void Init(uint32_t nbins) {
-    nbins_ = nbins;
+    if (nbins_ != nbins) {
+      nbins_ = nbins;
+      // quite expensive operation, so let's do this only once
+      data_.clear();
+    }
     row_ptr_.clear();
-    data_.clear();
+    n_nodes_added_ = 0;
   }
 
   // create an empty histogram for i-th node
@@ -382,18 +406,199 @@ class HistCollection {
     }
     CHECK_EQ(row_ptr_[nid], kMax);
 
-    row_ptr_[nid] = data_.size();
-    data_.resize(data_.size() + nbins_);
+    if (data_.size() < nbins_ * (nid + 1)) {
+      data_.resize(nbins_ * (nid + 1));
+    }
+
+    row_ptr_[nid] = nbins_ * n_nodes_added_;
+    n_nodes_added_++;
   }
 
  private:
   /*! \brief number of all bins over all features */
-  uint32_t nbins_;
+  uint32_t nbins_ = 0;
+  /*! \brief amount of active nodes in hist collection */
+  uint32_t n_nodes_added_ = 0;
 
   std::vector<tree::GradStats> data_;
 
-  /*! \brief row_ptr_[nid] locates bin for historgram of node nid */
+  /*! \brief row_ptr_[nid] locates bin for histogram of node nid */
   std::vector<size_t> row_ptr_;
+};
+
+/*!
+ * \brief Stores temporary histograms to compute them in parallel
+ * Supports processing multiple tree-nodes for nested parallelism
+ * Able to reduce histograms across threads in efficient way
+ */
+class ParallelGHistBuilder {
+ public:
+  void Init(size_t nbins) {
+    if (nbins != nbins_) {
+      hist_buffer_.Init(nbins);
+      nbins_ = nbins;
+    }
+  }
+
+  // Add new elements if needed, mark all hists as unused
+  // targeted_hists - already allocated hists which should contain final results after Reduce() call
+  void Reset(size_t nthreads, size_t nodes, const BlockedSpace2d& space,
+             const std::vector<GHistRow>& targeted_hists) {
+    hist_buffer_.Init(nbins_);
+    tid_nid_to_hist_.clear();
+    hist_memory_.clear();
+    threads_to_nids_map_.clear();
+
+    targeted_hists_ = targeted_hists;
+
+    CHECK_EQ(nodes, targeted_hists.size());
+
+    nodes_    = nodes;
+    nthreads_ = nthreads;
+
+    MatchThreadsToNodes(space);
+    AllocateAdditionalHistograms();
+    MatchNodeNidPairToHist();
+
+    hist_was_used_.resize(nthreads * nodes_);
+    std::fill(hist_was_used_.begin(), hist_was_used_.end(), static_cast<int>(false));
+  }
+
+  // Get specified hist, initialize hist by zeros if it wasn't used before
+  GHistRow GetInitializedHist(size_t tid, size_t nid) {
+    CHECK_LT(nid, nodes_);
+    CHECK_LT(tid, nthreads_);
+
+    size_t idx = tid_nid_to_hist_.at({tid, nid});
+    GHistRow hist = hist_memory_[idx];
+
+    if (!hist_was_used_[tid * nodes_ + nid]) {
+      InitilizeHistByZeroes(hist, 0, hist.size());
+      hist_was_used_[tid * nodes_ + nid] = static_cast<int>(true);
+    }
+
+    return hist;
+  }
+
+  // Reduce following bins (begin, end] for nid-node in dst across threads
+  void ReduceHist(size_t nid, size_t begin, size_t end) {
+    CHECK_GT(end, begin);
+    CHECK_LT(nid, nodes_);
+
+    GHistRow dst = targeted_hists_[nid];
+
+    bool is_updated = false;
+    for (size_t tid = 0; tid < nthreads_; ++tid) {
+      if (hist_was_used_[tid * nodes_ + nid]) {
+        is_updated = true;
+        const size_t idx = tid_nid_to_hist_.at({tid, nid});
+        GHistRow src = hist_memory_[idx];
+
+        if (dst.data() != src.data()) {
+          IncrementHist(dst, src, begin, end);
+        }
+      }
+    }
+    if (!is_updated) {
+      // In distributed mode - some tree nodes can be empty on local machines,
+      // So we need just set local hist by zeros in this case
+      InitilizeHistByZeroes(dst, begin, end);
+    }
+  }
+
+ protected:
+  void MatchThreadsToNodes(const BlockedSpace2d& space) {
+    const size_t space_size = space.Size();
+    const size_t chunck_size = space_size / nthreads_ + !!(space_size % nthreads_);
+
+    threads_to_nids_map_.resize(nthreads_ * nodes_, false);
+
+    for (size_t tid = 0; tid < nthreads_; ++tid) {
+      size_t begin = chunck_size * tid;
+      size_t end   = std::min(begin + chunck_size, space_size);
+
+      if (begin < space_size) {
+        size_t nid_begin = space.GetFirstDimension(begin);
+        size_t nid_end   = space.GetFirstDimension(end-1);
+
+        for (size_t nid = nid_begin; nid <= nid_end; ++nid) {
+          // true - means thread 'tid' will work to compute partial hist for node 'nid'
+          threads_to_nids_map_[tid * nodes_ + nid] = true;
+        }
+      }
+    }
+  }
+
+  void AllocateAdditionalHistograms() {
+    size_t hist_allocated_additionally = 0;
+
+    for (size_t nid = 0; nid < nodes_; ++nid) {
+      int nthreads_for_nid = 0;
+
+      for (size_t tid = 0; tid < nthreads_; ++tid) {
+        if (threads_to_nids_map_[tid * nodes_ + nid]) {
+          nthreads_for_nid++;
+        }
+      }
+
+      // In distributed mode - some tree nodes can be empty on local machines,
+      // set nthreads_for_nid to 0 in this case.
+      // In another case - allocate additional (nthreads_for_nid - 1) histograms,
+      // because one is already allocated externally (will store final result for the node).
+      hist_allocated_additionally += std::max<int>(0, nthreads_for_nid - 1);
+    }
+
+    for (size_t i = 0; i < hist_allocated_additionally; ++i) {
+      hist_buffer_.AddHistRow(i);
+    }
+  }
+
+  void MatchNodeNidPairToHist() {
+    size_t hist_total = 0;
+    size_t hist_allocated_additionally = 0;
+
+    for (size_t nid = 0; nid < nodes_; ++nid) {
+      bool first_hist = true;
+      for (size_t tid = 0; tid < nthreads_; ++tid) {
+        if (threads_to_nids_map_[tid * nodes_ + nid]) {
+          if (first_hist) {
+            hist_memory_.push_back(targeted_hists_[nid]);
+            first_hist = false;
+          } else {
+            hist_memory_.push_back(hist_buffer_[hist_allocated_additionally]);
+            hist_allocated_additionally++;
+          }
+          // map pair {tid, nid} to index of allocated histogram from hist_memory_
+          tid_nid_to_hist_[{tid, nid}] = hist_total++;
+          CHECK_EQ(hist_total, hist_memory_.size());
+        }
+      }
+    }
+  }
+
+  /*! \brief number of bins in each histogram */
+  size_t nbins_ = 0;
+  /*! \brief number of threads for parallel computation */
+  size_t nthreads_ = 0;
+  /*! \brief number of nodes which will be processed in parallel  */
+  size_t nodes_ = 0;
+  /*! \brief Buffer for additional histograms for Parallel processing  */
+  HistCollection hist_buffer_;
+  /*!
+   * \brief Marks which hists were used, it means that they should be merged.
+   * Contains only {true or false} values
+   * but 'int' is used instead of 'bool', because std::vector<bool> isn't thread safe
+   */
+  std::vector<int> hist_was_used_;
+
+  /*! \brief Buffer for additional histograms for Parallel processing  */
+  std::vector<bool> threads_to_nids_map_;
+  /*! \brief Contains histograms for final results  */
+  std::vector<GHistRow> targeted_hists_;
+  /*! \brief Allocated memory for histograms used for construction  */
+  std::vector<GHistRow> hist_memory_;
+  /*! \brief map pair {tid, nid} to index of allocated histogram from hist_memory_  */
+  std::map<std::pair<size_t, size_t>, size_t> tid_nid_to_hist_;
 };
 
 /*!
@@ -405,7 +610,6 @@ class GHistBuilder {
   inline void Init(size_t nthread, uint32_t nbins) {
     nthread_ = nthread;
     nbins_ = nbins;
-    thread_init_.resize(nthread_);
   }
 
   // construct a histogram via histogram aggregation
@@ -430,8 +634,6 @@ class GHistBuilder {
   size_t nthread_;
   /*! \brief number of all bins over all features */
   uint32_t nbins_;
-  std::vector<size_t> thread_init_;
-  std::vector<tree::GradStats> data_;
 };
 
 
