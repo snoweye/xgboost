@@ -199,7 +199,7 @@ class CutsBuilder {
   }
 
   void AddCutPoint(WQSketch::SummaryContainer const& summary, int max_bin) {
-    int required_cuts = std::min(static_cast<int>(summary.size), max_bin);
+    size_t required_cuts = std::min(summary.size, static_cast<size_t>(max_bin));
     for (size_t i = 1; i < required_cuts; ++i) {
       bst_float cpt = summary.data[i].value;
       if (i == 1 || cpt > p_cuts_->cut_values_.back()) {
@@ -244,7 +244,7 @@ class DenseCuts  : public CutsBuilder {
       CutsBuilder(container) {
     monitor_.Init(__FUNCTION__);
   }
-  void Init(std::vector<WQSketch>* sketchs, uint32_t max_num_bins);
+  void Init(std::vector<WQSketch>* sketchs, uint32_t max_num_bins, size_t max_rows);
   void Build(DMatrix* p_fmat, uint32_t max_num_bins) override;
 };
 
